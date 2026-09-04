@@ -30,6 +30,12 @@ webcam --> hand_tracker.py (MediaPipe) --> OSC --> TouchDesigner (particles/flui
   It still builds and runs on its own; see [Fallback: the C++ simulation](#fallback-the-c-simulation).
 - **`docs/TOUCHDESIGNER_GUIDE.md`** is the receiving half: exact node
   network, Python callback script, and an optional GLSL bloom pass.
+- **`touchdesigner/`** holds the TouchDesigner side itself: a script that
+  builds the full starter network (`build_network.py`), the frame-by-frame
+  gesture logic it wires in (`matterbending_callbacks.py`), an optional
+  GLSL bloom pass (`glow_bloom.frag`), and once generated, the project
+  file itself (`matterbending.toe`). See
+  [touchdesigner/README.md](touchdesigner/README.md) for exact steps.
 
 ## Setup
 
@@ -82,16 +88,23 @@ the camera first.
 
 ## Connecting TouchDesigner
 
-1. Start TouchDesigner, add an **OSC In CHOP**, set `Network Port` to
-   `9000` (matching `--osc-port`), and `Split Values` on.
-2. Run `python3 hand_tracker.py` — with a hand in frame, the CHOP's
-   `present` channel should read `1` and `palm:x`/`palm:y` should move as
-   your hand does.
-3. Follow [docs/TOUCHDESIGNER_GUIDE.md](docs/TOUCHDESIGNER_GUIDE.md) for
-   the full node network (palm → particle movement, pinch → attract, open
-   palm → repel, the glow/trail look) and paste in
-   `docs/touchdesigner/matterbending_callbacks.py` as your Execute DAT
-   callback.
+Fastest path: open TouchDesigner, open the Textport, and run
+`touchdesigner/build_network.py` once — it builds the full starter network
+(OSC input, particle/water system, gesture-driven forces, glow + trails)
+and saves `touchdesigner/matterbending.toe`. Exact steps and what the
+network looks like: [touchdesigner/README.md](touchdesigner/README.md).
+
+To build it by hand instead, or to understand what the generated network
+does: [docs/TOUCHDESIGNER_GUIDE.md](docs/TOUCHDESIGNER_GUIDE.md) covers
+the full node network (palm → particle position, pinch → attract, grab →
+stronger/rougher deformation, open palm → repel, presence → visibility and
+reset, the glow/trail look).
+
+Either way, first confirm the link itself works: add an **OSC In CHOP**,
+set `Network Port` to `9000` (matching `--osc-port`) and `Split Values`
+on, then run `python3 hand_tracker.py` — with a hand in frame, the CHOP's
+`present` channel should read `1` and `palm:x`/`palm:y` should move as
+your hand does.
 
 ## Testing
 
@@ -145,27 +158,35 @@ matter-bending/
 │   └── validate.sh                # compile + test + smoke-test
 ├── tests/
 │   ├── test_gesture_math.py
-│   └── test_osc_bridge.py
-└── docs/
-    ├── OSC_SCHEMA.md               # every OSC address, type, and range
-    ├── TOUCHDESIGNER_GUIDE.md      # receiving-end node network + walkthrough
-    └── touchdesigner/
-        ├── matterbending_callbacks.py  # paste into an Execute DAT
-        └── glow_bloom.frag              # optional GLSL bloom pass
+│   ├── test_osc_bridge.py
+│   └── test_osc_integration.py
+├── docs/
+│   ├── OSC_SCHEMA.md               # every OSC address, type, and range
+│   └── TOUCHDESIGNER_GUIDE.md      # receiving-end node network + walkthrough
+└── touchdesigner/
+    ├── build_network.py            # run once inside TD: builds the whole network + saves the .toe
+    ├── matterbending_callbacks.py  # frame-by-frame gesture logic (single source of truth)
+    ├── glow_bloom.frag             # optional GLSL bloom pass
+    ├── README.md                   # exact manual steps + network diagram
+    └── matterbending.toe           # generated project (not present until you run build_network.py)
 ```
 
 ## What's next
 
-The first TouchDesigner-ready version covers hand tracking → OSC →
-(documented) particle attract/repel. Not yet built:
+Hand tracking → OSC → a scripted TouchDesigner particle/water network are
+in place; `touchdesigner/build_network.py` builds the `.toe` for you (see
+[touchdesigner/README.md](touchdesigner/README.md)). Not yet done:
 
-- An actual `.toe` project file, once this can be assembled and verified
-  inside TouchDesigner itself rather than documented blind.
+- **Opening the generated project in real TouchDesigner** and fixing
+  whatever the build script's `MANUAL FIXUPS NEEDED` list flags — it was
+  written and syntax-checked without TouchDesigner installed, so this
+  first run is a verification pass, not a formality.
 - The avatar-formation step described in the TouchDesigner guide's
-  "Later: transform particles into an avatar" section — the OSC schema
-  and callback script already track an `assemble` value for this, but the
-  avatar point-cloud target and the shader blend between chaotic and
-  assembled states aren't built yet.
-- Per-user calibration of the gesture thresholds in `gesture_math.py` —
-  current defaults are reasonable guesses, not tuned against real camera
-  data.
+  "Later: transform particles into an avatar" section — `assemble1`
+  already ramps with sustained pinch/grab and open palm, but nothing
+  consumes it yet; the avatar point-cloud target and the per-particle
+  blend still need building.
+- Per-user calibration of the gesture thresholds in `gesture_math.py` and
+  the force strengths in `matterbending_callbacks.py` — current defaults
+  are reasonable guesses, not tuned against real camera data or a real TD
+  render.
