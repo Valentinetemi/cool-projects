@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Downloaded MediaPipe model (fetch with scripts/download_model.sh)
+hand_landmarker.task
+
+# Compiled C++ fallback binary (rebuild with clang++, see README.md)
+spatial
