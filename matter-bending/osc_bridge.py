@@ -83,7 +83,7 @@ class OscSender:
 
         try:
             bundle = osc_bundle_builder.OscBundleBuilder(
-                osc_bundle_builder.OscBundleBuilder.IMMEDIATELY
+                osc_bundle_builder.IMMEDIATELY
             )
             for address, value in build_messages(state):
                 builder = osc_message_builder.OscMessageBuilder(address=address)
