@@ -1,42 +1,103 @@
-from pathlib import Path
+"""MediaPipe hand-tracking layer for Matter Bending.
+
+Reads the webcam, runs MediaPipe's Hand Landmarker, derives a smoothed
+palm-center position plus pinch/openness/gesture state, and streams that
+state to TouchDesigner over OSC every frame. See docs/OSC_SCHEMA.md for the
+wire format and docs/TOUCHDESIGNER_GUIDE.md for the receiving end.
+
+The geometry/gesture math lives in gesture_math.py and the OSC wire format
+in osc_bridge.py -- both are dependency-free and unit tested on their own;
+this file is the thin orchestration layer that wires camera capture,
+MediaPipe inference, on-screen debug drawing, and OSC output together.
+"""
+
+import argparse
+import sys
 import time
+from pathlib import Path
 
-import cv2
-import mediapipe as mp
-
+import gesture_math as gm
+import osc_bridge as ob
 
 MODEL_PATH = Path(__file__).resolve().with_name("hand_landmarker.task")
 
-# MediaPipe's 21 hand landmarks connected as a hand skeleton.
-HAND_CONNECTIONS = (
-    (0, 1), (1, 2), (2, 3), (3, 4),
-    (0, 5), (5, 6), (6, 7), (7, 8),
-    (5, 9), (9, 10), (10, 11), (11, 12),
-    (9, 13), (13, 14), (14, 15), (15, 16),
-    (13, 17), (0, 17), (17, 18), (18, 19), (19, 20),
-)
-
-# Wrist and the four finger-base knuckles form a stable palm position.
-PALM_LANDMARK_INDICES = (0, 5, 9, 13, 17)
-SMOOTHING_ALPHA = 0.25
+DEFAULT_OSC_HOST = "127.0.0.1"
+DEFAULT_OSC_PORT = 9000
+DEFAULT_DEBUG_INTERVAL = 0.2  # seconds between printed debug lines
 
 
-def landmark_to_pixel(landmark, frame_width, frame_height):
-    """Convert a normalized MediaPipe landmark to a safe pixel position."""
-    x = max(0, min(frame_width - 1, int(landmark.x * frame_width)))
-    y = max(0, min(frame_height - 1, int(landmark.y * frame_height)))
-    return x, y
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--osc-host",
+        default=DEFAULT_OSC_HOST,
+        help=f"TouchDesigner OSC receiver host (default: {DEFAULT_OSC_HOST})",
+    )
+    parser.add_argument(
+        "--osc-port",
+        type=int,
+        default=DEFAULT_OSC_PORT,
+        help=f"TouchDesigner OSC receiver port (default: {DEFAULT_OSC_PORT})",
+    )
+    parser.add_argument(
+        "--camera-index",
+        type=int,
+        default=0,
+        help="OpenCV camera index to open (default: 0)",
+    )
+    parser.add_argument(
+        "--model-path",
+        type=Path,
+        default=MODEL_PATH,
+        help=f"Path to hand_landmarker.task (default: {MODEL_PATH})",
+    )
+    parser.add_argument(
+        "--debug-interval",
+        type=float,
+        default=DEFAULT_DEBUG_INTERVAL,
+        help="Minimum seconds between printed debug lines; 0 prints every "
+        f"frame (default: {DEFAULT_DEBUG_INTERVAL})",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Skip the OpenCV preview window (camera + OSC only, lower overhead)",
+    )
+    return parser.parse_args(argv)
+
+
+def require_model(model_path):
+    """Exit with a clear, friendly message if the model file is missing.
+
+    Called before touching the camera or MediaPipe so a missing model fails
+    immediately rather than after the webcam light turns on.
+    """
+    if model_path.is_file():
+        return
+
+    print(
+        f"Hand Landmarker model not found: {model_path}\n\n"
+        "Fetch it with:\n"
+        "    bash scripts/download_model.sh\n\n"
+        "or download the float16 hand_landmarker.task model manually from "
+        "the MediaPipe model zoo (see README.md) and place it beside "
+        "hand_tracker.py.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def draw_hand_landmarks(frame, landmarks):
     """Draw the Tasks API landmark list using OpenCV."""
+    import cv2
+
     frame_height, frame_width = frame.shape[:2]
     pixel_landmarks = [
-        landmark_to_pixel(landmark, frame_width, frame_height)
+        gm.landmark_to_pixel(landmark, frame_width, frame_height)
         for landmark in landmarks
     ]
 
-    for start_index, end_index in HAND_CONNECTIONS:
+    for start_index, end_index in gm.HAND_CONNECTIONS:
         cv2.line(
             frame,
             pixel_landmarks[start_index],
@@ -49,40 +110,34 @@ def draw_hand_landmarks(frame, landmarks):
         cv2.circle(frame, point, 4, (255, 180, 60), -1)
 
 
-def palm_center(landmarks):
-    """Return one normalized control coordinate near the hand's center."""
-    x = sum(landmarks[index].x for index in PALM_LANDMARK_INDICES) / len(
-        PALM_LANDMARK_INDICES
-    )
-    y = sum(landmarks[index].y for index in PALM_LANDMARK_INDICES) / len(
-        PALM_LANDMARK_INDICES
-    )
-    return max(0.0, min(1.0, x)), max(0.0, min(1.0, y))
-
-
-def smooth_coordinate(previous, current):
-    """Reduce frame-to-frame landmark jitter with an exponential average."""
-    if previous is None:
-        return current
-
-    previous_x, previous_y = previous
-    current_x, current_y = current
-    return (
-        previous_x + SMOOTHING_ALPHA * (current_x - previous_x),
-        previous_y + SMOOTHING_ALPHA * (current_y - previous_y),
+def build_hand_state(landmarks, smoothed_control):
+    """Compute the full OSC-ready HandState for one frame's landmarks."""
+    control_x, control_y = smoothed_control
+    pinch = gm.pinch_distance(landmarks)
+    openness = gm.hand_openness(landmarks)
+    gesture = gm.classify_gesture(pinch, openness)
+    return ob.HandState(
+        present=True,
+        palm_x=control_x,
+        palm_y=control_y,
+        pinch_distance=pinch,
+        openness=openness,
+        gesture=gesture,
+        gesture_id=gm.gesture_id(gesture),
     )
 
 
-def main():
-    if not MODEL_PATH.is_file():
-        raise FileNotFoundError(
-            f"Hand Landmarker model not found: {MODEL_PATH}\n"
-            "Download the full float16 hand_landmarker.task model and place it "
-            "beside hand_tracker.py."
-        )
+def main(argv=None):
+    args = parse_args(argv)
+    require_model(args.model_path)
+
+    # Imported after require_model() so a missing model fails fast without
+    # paying for the (fairly slow) mediapipe/cv2 import first.
+    import cv2
+    import mediapipe as mp
 
     options = mp.tasks.vision.HandLandmarkerOptions(
-        base_options=mp.tasks.BaseOptions(model_asset_path=str(MODEL_PATH)),
+        base_options=mp.tasks.BaseOptions(model_asset_path=str(args.model_path)),
         running_mode=mp.tasks.vision.RunningMode.VIDEO,
         num_hands=1,
         min_hand_detection_confidence=0.7,
@@ -90,12 +145,22 @@ def main():
         min_tracking_confidence=0.7,
     )
 
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(args.camera_index)
     if not cap.isOpened():
-        raise RuntimeError("Could not open webcam 0")
+        print(
+            f"Could not open webcam {args.camera_index}. Check that no other "
+            "application is using the camera and that this process has "
+            "camera permission.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    sender = ob.OscSender(args.osc_host, args.osc_port)
+    print(f"Sending OSC to {args.osc_host}:{args.osc_port} (Ctrl+C to quit)")
 
     smoothed_control = None
     last_timestamp_ms = -1
+    last_debug_print = 0.0
 
     try:
         with mp.tasks.vision.HandLandmarker.create_from_options(options) as landmarker:
@@ -124,41 +189,53 @@ def main():
 
                 if result.hand_landmarks:
                     landmarks = result.hand_landmarks[0]
-                    draw_hand_landmarks(frame, landmarks)
 
-                    smoothed_control = smooth_coordinate(
+                    smoothed_control = gm.smooth_coordinate(
                         smoothed_control,
-                        palm_center(landmarks),
+                        gm.palm_center(landmarks),
                     )
-                    control_x, control_y = smoothed_control
+                    state = build_hand_state(landmarks, smoothed_control)
 
-                    print(f"({control_x:.3f}, {control_y:.3f})")
-
-                    frame_height, frame_width = frame.shape[:2]
-                    control_pixel = (
-                        min(frame_width - 1, int(control_x * frame_width)),
-                        min(frame_height - 1, int(control_y * frame_height)),
-                    )
-                    cv2.circle(frame, control_pixel, 8, (0, 0, 255), -1)
-                    cv2.putText(
-                        frame,
-                        f"control: ({control_x:.3f}, {control_y:.3f})",
-                        (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (255, 255, 255),
-                        2,
-                    )
+                    if not args.headless:
+                        draw_hand_landmarks(frame, landmarks)
+                        frame_height, frame_width = frame.shape[:2]
+                        control_pixel = (
+                            min(frame_width - 1, int(state.palm_x * frame_width)),
+                            min(frame_height - 1, int(state.palm_y * frame_height)),
+                        )
+                        cv2.circle(frame, control_pixel, 8, (0, 0, 255), -1)
+                        cv2.putText(
+                            frame,
+                            state.gesture,
+                            (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8,
+                            (255, 255, 255),
+                            2,
+                        )
                 else:
                     smoothed_control = None
+                    state = ob.absent_state()
 
-                cv2.imshow("Matter Bending - Hand Tracking", frame)
+                # UDP send is fire-and-forget and non-blocking, so this never
+                # stalls the camera loop even if TouchDesigner isn't running.
+                sender.send(state)
 
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
+                now = time.monotonic()
+                if now - last_debug_print >= args.debug_interval:
+                    print(ob.format_debug_line(state))
+                    last_debug_print = now
+
+                if not args.headless:
+                    cv2.imshow("Matter Bending - Hand Tracking", frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+    except KeyboardInterrupt:
+        print("\nStopped.")
     finally:
         cap.release()
-        cv2.destroyAllWindows()
+        if not args.headless:
+            cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
