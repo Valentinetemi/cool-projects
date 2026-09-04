@@ -10,3 +10,9 @@ hand_landmarker.task
 
 # Compiled C++ fallback binary (rebuild with clang++, see README.md)
 spatial
+
+# TouchDesigner auto-backup files (matterbending.toe itself is committed;
+# these numbered/backup copies TD generates alongside it are not)
+touchdesigner/*.toe.backup
+touchdesigner/*.[0-9].toe
+touchdesigner/*.[0-9][0-9].toe
