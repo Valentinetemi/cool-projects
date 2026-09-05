@@ -24,6 +24,19 @@ MODEL_PATH = Path(__file__).resolve().with_name("hand_landmarker.task")
 DEFAULT_OSC_HOST = "127.0.0.1"
 DEFAULT_OSC_PORT = 9000
 DEFAULT_DEBUG_INTERVAL = 0.2  # seconds between printed debug lines
+DEFAULT_DIAGNOSTIC_INDICES = (0, 1, 2)
+
+# Some macOS camera backends report a device as opened before it has
+# actually started streaming, so the first handful of reads can fail even
+# though the camera is about to work fine. These bound how long we wait
+# for that warm-up before treating it as a real failure.
+CAMERA_WARMUP_ATTEMPTS = 30
+CAMERA_WARMUP_DELAY = 0.1  # seconds
+
+# After a successful start, how many *consecutive* failed reads we tolerate
+# (e.g. a brief autofocus hiccup) before deciding the camera has genuinely
+# stopped and giving up.
+MAX_CONSECUTIVE_READ_FAILURES = 30
 
 
 def parse_args(argv=None):
@@ -63,6 +76,16 @@ def parse_args(argv=None):
         action="store_true",
         help="Skip the OpenCV preview window (camera + OSC only, lower overhead)",
     )
+    parser.add_argument(
+        "--diagnose-camera",
+        action="store_true",
+        help=(
+            "Probe camera indexes "
+            f"{list(DEFAULT_DIAGNOSTIC_INDICES)} to see which ones open and "
+            "return frames, print a report, then exit without touching the "
+            "model or OSC"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -85,6 +108,95 @@ def require_model(model_path):
         file=sys.stderr,
     )
     sys.exit(1)
+
+
+def probe_camera_index(
+    index,
+    cv2,
+    warmup_attempts=CAMERA_WARMUP_ATTEMPTS,
+    warmup_delay=CAMERA_WARMUP_DELAY,
+):
+    """Open camera `index`, try to read one frame, and report what happened.
+
+    Retries reads for up to `warmup_attempts` so a slow-starting backend
+    (common on macOS) isn't mistaken for a camera that doesn't work at all.
+    """
+    cap = cv2.VideoCapture(index)
+    opened = cap.isOpened()
+    read_ok = False
+    width = height = None
+
+    if opened:
+        for _ in range(warmup_attempts):
+            success, frame = cap.read()
+            if success and frame is not None:
+                read_ok = True
+                height, width = frame.shape[:2]
+                break
+            time.sleep(warmup_delay)
+
+    cap.release()
+    return {
+        "index": index,
+        "opened": opened,
+        "read_ok": read_ok,
+        "width": width,
+        "height": height,
+    }
+
+
+def format_probe_result(probe):
+    """Human-readable one-line summary of a probe_camera_index() result."""
+    index = probe["index"]
+    if not probe["opened"]:
+        return f"  index {index}: could not open (no such camera / no permission)"
+    if not probe["read_ok"]:
+        return f"  index {index}: opened but never returned a frame"
+    return f"  index {index}: OK ({probe['width']}x{probe['height']})"
+
+
+def run_camera_diagnostics(
+    indices,
+    cv2,
+    warmup_attempts=CAMERA_WARMUP_ATTEMPTS,
+    warmup_delay=CAMERA_WARMUP_DELAY,
+):
+    """Probe each camera index in `indices` and print a short report."""
+    print(f"Probing camera indexes {list(indices)}...")
+    results = [
+        probe_camera_index(index, cv2, warmup_attempts, warmup_delay)
+        for index in indices
+    ]
+    for result in results:
+        print(format_probe_result(result))
+
+    working = [result["index"] for result in results if result["read_ok"]]
+    if working:
+        print(f"\nWorking index(es): {working}. Try --camera-index {working[0]}.")
+    else:
+        print(
+            "\nNo camera index produced a frame. On macOS: open System "
+            "Settings > Privacy & Security > Camera and make sure your "
+            "terminal (or IDE) is allowed access, then quit any other app "
+            "that might be holding the camera (Zoom, FaceTime, Photo Booth, "
+            "another hand_tracker.py process, etc.) and try again."
+        )
+    return results
+
+
+def warm_up_camera(cap, attempts=CAMERA_WARMUP_ATTEMPTS, delay=CAMERA_WARMUP_DELAY):
+    """Read (and discard) frames until the first one succeeds.
+
+    Returns True as soon as a frame comes back, False if none did after
+    `attempts` tries. See CAMERA_WARMUP_ATTEMPTS for why this retries
+    instead of failing on the very first unsuccessful read.
+    """
+    for _ in range(attempts):
+        success, frame = cap.read()
+        if success and frame is not None:
+            return True
+        time.sleep(delay)
+    return False
 
 
 def draw_hand_landmarks(frame, landmarks):
@@ -129,6 +241,13 @@ def build_hand_state(landmarks, smoothed_control):
 
 def main(argv=None):
     args = parse_args(argv)
+
+    if args.diagnose_camera:
+        import cv2
+
+        run_camera_diagnostics(DEFAULT_DIAGNOSTIC_INDICES, cv2)
+        return
+
     require_model(args.model_path)
 
     # Imported after require_model() so a missing model fails fast without
@@ -148,19 +267,38 @@ def main(argv=None):
     cap = cv2.VideoCapture(args.camera_index)
     if not cap.isOpened():
         print(
-            f"Could not open webcam {args.camera_index}. Check that no other "
-            "application is using the camera and that this process has "
-            "camera permission.",
+            f"Could not open webcam {args.camera_index}. On macOS this is "
+            "usually either camera permission (check System Settings > "
+            "Privacy & Security > Camera for your terminal/IDE) or another "
+            "app already holding the camera (Zoom, FaceTime, Photo Booth, "
+            "another hand_tracker.py process, etc.).",
             file=sys.stderr,
         )
+        cap.release()
+        run_camera_diagnostics(DEFAULT_DIAGNOSTIC_INDICES, cv2)
+        sys.exit(1)
+
+    if not warm_up_camera(cap):
+        print(
+            f"Webcam {args.camera_index} opened but never returned a frame "
+            f"after {CAMERA_WARMUP_ATTEMPTS} attempts. This is usually a "
+            "camera-permission prompt that never appeared, or another "
+            "process holding the device.",
+            file=sys.stderr,
+        )
+        cap.release()
+        run_camera_diagnostics(DEFAULT_DIAGNOSTIC_INDICES, cv2)
         sys.exit(1)
 
     sender = ob.OscSender(args.osc_host, args.osc_port)
     print(f"Sending OSC to {args.osc_host}:{args.osc_port} (Ctrl+C to quit)")
+    if not args.headless:
+        print("Opening preview window 'Matter Bending - Hand Tracking' (press 'q' to quit)")
 
     smoothed_control = None
     last_timestamp_ms = -1
     last_debug_print = 0.0
+    consecutive_read_failures = 0
 
     try:
         with mp.tasks.vision.HandLandmarker.create_from_options(options) as landmarker:
@@ -168,7 +306,23 @@ def main(argv=None):
                 success, frame = cap.read()
 
                 if not success:
-                    break
+                    consecutive_read_failures += 1
+                    if consecutive_read_failures == 1:
+                        print(
+                            "Warning: dropped a frame from the camera.",
+                            file=sys.stderr,
+                        )
+                    if consecutive_read_failures >= MAX_CONSECUTIVE_READ_FAILURES:
+                        print(
+                            "Camera stopped returning frames after "
+                            f"{consecutive_read_failures} consecutive failed "
+                            "reads. It may have been disconnected or claimed "
+                            "by another application.",
+                            file=sys.stderr,
+                        )
+                        break
+                    continue
+                consecutive_read_failures = 0
 
                 # Mirror the camera so movement feels natural.
                 frame = cv2.flip(frame, 1)
