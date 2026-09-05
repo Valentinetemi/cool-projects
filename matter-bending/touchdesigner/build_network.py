@@ -7,20 +7,28 @@ touchdesigner/README.md for the exact steps to run this.
 
 This script was written and syntax-checked without TouchDesigner installed
 (see the repo's development notes) -- every TD operator TYPE it creates
-(oscinCHOP, particleSOP, forceSOP, geoCOMP, renderTOP, ...) is a long-stable
-part of TD's Python API and should exist across TD versions. A handful of
-individual PARAMETER names are less certain (exact internal names for
-things like Force SOP's position/type, or Particle SOP's reset pulse, can
-vary by version) -- every parameter set below is wrapped so a bad guess is
-recorded as a warning and skipped rather than crashing the build. Read the
+(oscinCHOP, particleSOP, forceSOP, geometryCOMP, renderTOP, ...) is a
+long-stable part of TD's Python API and should exist across TD versions,
+but a couple of these symbol names were still guessed wrong on the first
+pass (geoCOMP instead of geometryCOMP, constMAT instead of constantMAT --
+both fixed). To make sure a *remaining* wrong guess degrades gracefully
+instead of crashing the whole build like that did, every operator type is
+looked up by name through resolve_optype() rather than referenced as a bare
+symbol directly: if a name isn't recognized in your TD version, that one
+node (and anything that depended on it) is skipped with a warning, and the
+rest of the network still gets built. Individual PARAMETER names (exact
+internal names for things like Force SOP's position/type, or Particle
+SOP's reset pulse, which can vary by version) are handled the same way --
+tried, and on failure recorded as a warning instead of raising. Read the
 summary this script prints at the end: anything under "MANUAL FIXUPS
-NEEDED" is a short, precise list of exactly what to set by hand in the UI
-(TD's own parameter dialog will show you the right name once you're
+NEEDED" is a short, precise list of exactly what to check by hand in the
+UI (TD's own parameter dialog will show you the right name once you're
 looking at the node).
 
-Safe to re-run: it destroys and rebuilds /matterbending1 from scratch each
-time, so any manual edits inside that COMP will be lost -- duplicate it
-first if you want to keep changes.
+Safe to re-run, including after a partial/failed build: it destroys and
+rebuilds /matterbending1 from scratch each time (destroying a COMP
+destroys everything inside it too), so any manual edits inside that COMP
+will be lost -- duplicate it first if you want to keep changes.
 """
 
 # Edit these two if you move the repo somewhere other than where this
@@ -46,11 +54,40 @@ def warn(msg):
     log("WARNING: {}".format(msg))
 
 
-def create_op(container, optype, name, label):
+def resolve_optype(type_name):
+    """Look up a TD operator-type symbol (e.g. "geometryCOMP") by name.
+
+    TD injects these as plain names in the running namespace, the same way
+    `op`/`me`/`project` are available everywhere -- eval() resolves a name
+    exactly like referencing it directly would, but inside a try/except
+    instead of at the top level, so an unrecognized name (wrong guess, or a
+    symbol that genuinely doesn't exist in this TD version) becomes a
+    catchable NameError instead of crashing the whole script.
+    """
+    try:
+        return eval(type_name)
+    except NameError:
+        warn(
+            "operator type '{}' isn't recognized in this TouchDesigner "
+            "version -- every node that needs it will be skipped".format(type_name)
+        )
+        return None
+
+
+def create_op(container, optype_name, name, label):
     """Create `name` in `container`, replacing it if it already exists."""
+    if container is None:
+        warn("skipping '{}' ({}): its container failed to create earlier".format(name, label))
+        return None
+
     existing = container.op(name)
     if existing is not None:
         existing.destroy()
+
+    optype = resolve_optype(optype_name)
+    if optype is None:
+        return None
+
     try:
         new_op = container.create(optype, name)
         REPORT["created"].append(name)
@@ -113,36 +150,36 @@ def read_text_file(path, description):
 
 
 def build_osc_chain(base):
-    osc_hand = create_op(base, oscinCHOP, "osc_hand", "OSC In CHOP")
+    osc_hand = create_op(base, "oscinCHOP", "osc_hand", "OSC In CHOP")
     set_par(osc_hand, "port", 9000, "OSC network port")
 
-    hand_data = create_op(base, nullCHOP, "hand_data", "Null CHOP")
+    hand_data = create_op(base, "nullCHOP", "hand_data", "Null CHOP")
     connect(hand_data, osc_hand, context="osc_hand -> hand_data")
 
     return hand_data
 
 
 def build_particle_system(base):
-    geo = create_op(base, geoCOMP, "geo1", "Geometry COMP")
+    geo = create_op(base, "geometryCOMP", "geo1", "Geometry COMP")
     if geo is None:
         return None, None
 
     # Everything below lives inside geo1's own SOP network.
-    source1 = create_op(geo, sphereSOP, "source1", "Sphere SOP (particle birth source)")
+    source1 = create_op(geo, "sphereSOP", "source1", "Sphere SOP (particle birth source)")
     set_par(source1, "rad1", 1.5, "source radius")
 
-    particle1 = create_op(geo, particleSOP, "particle1", "Particle SOP")
+    particle1 = create_op(geo, "particleSOP", "particle1", "Particle SOP")
     set_par(particle1, "life", 4.0, "particle life expectancy (seconds)")
 
-    attract1 = create_op(geo, forceSOP, "attract1", "Force SOP (attract/repel)")
+    attract1 = create_op(geo, "forceSOP", "attract1", "Force SOP (attract/repel)")
     set_par_any(attract1, ("type",), "attract", "force type")
     set_par(attract1, "strength", 0.0, "initial strength")
 
-    turbulence1 = create_op(geo, forceSOP, "turbulence1", "Force SOP (grab deformation)")
+    turbulence1 = create_op(geo, "forceSOP", "turbulence1", "Force SOP (grab deformation)")
     set_par_any(turbulence1, ("type",), "turbulence", "force type")
     set_par(turbulence1, "strength", 0.0, "initial strength")
 
-    merge1 = create_op(geo, mergeSOP, "merge1", "Merge SOP (combine forces)")
+    merge1 = create_op(geo, "mergeSOP", "merge1", "Merge SOP (combine forces)")
     connect(merge1, attract1, input_index=0, context="attract1 -> merge1")
     connect(merge1, turbulence1, input_index=1, context="turbulence1 -> merge1")
 
@@ -150,58 +187,60 @@ def build_particle_system(base):
     connect(particle1, merge1, input_index=1, context="merge1 -> particle1 (forces)")
 
     avatar_placeholder1 = create_op(
-        geo, sphereSOP, "avatar_placeholder1", "avatar-assembly placeholder geometry"
+        geo, "sphereSOP", "avatar_placeholder1", "avatar-assembly placeholder geometry"
     )
-    avatar_placeholder1.bypass = True
+    if avatar_placeholder1 is not None:
+        avatar_placeholder1.bypass = True
 
-    mat1 = create_op(base, constMAT, "glow_mat1", "Constant MAT (particle color)")
+    mat1 = create_op(base, "constantMAT", "glow_mat1", "Constant MAT (particle color)")
     set_par(mat1, "colorr", 0.4, "glow color R")
     set_par(mat1, "colorg", 0.8, "glow color G")
     set_par(mat1, "colorb", 1.0, "glow color B")
 
     set_par(geo, "material", "../glow_mat1", "assign particle material")
 
-    try:
-        particle1.render = True
-    except Exception as exc:
-        warn("could not set particle1.render = True: {}".format(exc))
+    if particle1 is not None:
+        try:
+            particle1.render = True
+        except Exception as exc:
+            warn("could not set particle1.render = True: {}".format(exc))
 
     return geo, particle1
 
 
 def build_render_chain(base, geo):
-    cam1 = create_op(base, cameraCOMP, "cam1", "Camera COMP")
+    cam1 = create_op(base, "cameraCOMP", "cam1", "Camera COMP")
     set_par(cam1, "tz", 8.0, "camera pull-back distance")
 
-    light1 = create_op(base, lightCOMP, "light1", "Light COMP")
+    light1 = create_op(base, "lightCOMP", "light1", "Light COMP")
 
-    render1 = create_op(base, renderTOP, "render1", "Render TOP")
+    render1 = create_op(base, "renderTOP", "render1", "Render TOP")
     set_par(render1, "camera", "../cam1", "render camera")
     set_par(render1, "lights", "../light1", "render light")
 
-    blur1 = create_op(base, blurTOP, "blur1", "Blur TOP (bloom source)")
+    blur1 = create_op(base, "blurTOP", "blur1", "Blur TOP (bloom source)")
     set_par_any(blur1, ("size", "blursize"), 12.0, "blur radius")
     connect(blur1, render1, context="render1 -> blur1")
 
-    glow_comp1 = create_op(base, compositeTOP, "glow_comp1", "Composite TOP (additive glow)")
+    glow_comp1 = create_op(base, "compositeTOP", "glow_comp1", "Composite TOP (additive glow)")
     set_par_any(glow_comp1, ("operand",), "add", "composite blend mode")
     connect(glow_comp1, render1, input_index=0, context="render1 -> glow_comp1")
     connect(glow_comp1, blur1, input_index=1, context="blur1 -> glow_comp1")
 
-    level1 = create_op(base, levelTOP, "level1", "Level TOP (trail fade)")
+    level1 = create_op(base, "levelTOP", "level1", "Level TOP (trail fade)")
     set_par_any(level1, ("brightness1", "opacity"), 0.9, "trail fade amount")
 
-    feedback1 = create_op(base, feedbackTOP, "feedback1", "Feedback TOP (trails)")
+    feedback1 = create_op(base, "feedbackTOP", "feedback1", "Feedback TOP (trails)")
     set_par_any(feedback1, ("top",), "../level1", "feedback source")
 
-    trail_comp1 = create_op(base, compositeTOP, "trail_comp1", "Composite TOP (trails + glow)")
+    trail_comp1 = create_op(base, "compositeTOP", "trail_comp1", "Composite TOP (trails + glow)")
     set_par_any(trail_comp1, ("operand",), "add", "composite blend mode")
     connect(trail_comp1, glow_comp1, input_index=0, context="glow_comp1 -> trail_comp1")
     connect(trail_comp1, feedback1, input_index=1, context="feedback1 -> trail_comp1")
 
     connect(level1, trail_comp1, context="trail_comp1 -> level1 (close feedback loop)")
 
-    final_out = create_op(base, nullTOP, "final_out", "Null TOP (final output)")
+    final_out = create_op(base, "nullTOP", "final_out", "Null TOP (final output)")
     connect(final_out, trail_comp1, context="trail_comp1 -> final_out")
 
     # Bonus/optional: the custom GLSL bloom pass from glow_bloom.frag, left
@@ -209,10 +248,10 @@ def build_render_chain(base, geo):
     # click inside TD before they can be scripted, see touchdesigner/README.md.
     glsl_text = read_text_file(GLSL_SOURCE_PATH, "glow_bloom.frag")
     if glsl_text:
-        shader_dat = create_op(base, textDAT, "glow_bloom_shader", "GLSL source (Text DAT)")
+        shader_dat = create_op(base, "textDAT", "glow_bloom_shader", "GLSL source (Text DAT)")
         if shader_dat is not None:
             shader_dat.text = glsl_text
-        glow_glsl1 = create_op(base, glslTOP, "glow_glsl1", "GLSL TOP (optional bonus bloom)")
+        glow_glsl1 = create_op(base, "glslTOP", "glow_glsl1", "GLSL TOP (optional bonus bloom)")
         set_par(glow_glsl1, "pixeldat", "../glow_bloom_shader", "pixel shader source")
         connect(glow_glsl1, render1, context="render1 -> glow_glsl1 (optional)")
         warn(
@@ -226,7 +265,7 @@ def build_render_chain(base, geo):
 
 
 def build_avatar_placeholder_channel(base):
-    assemble1 = create_op(base, constantCHOP, "assemble1", "Constant CHOP (avatar-assembly placeholder)")
+    assemble1 = create_op(base, "constantCHOP", "assemble1", "Constant CHOP (avatar-assembly placeholder)")
     set_par_any(assemble1, ("name0",), "assemble", "channel name")
     set_par_any(assemble1, ("value0",), 0.0, "initial value")
     return assemble1
@@ -234,13 +273,15 @@ def build_avatar_placeholder_channel(base):
 
 def build_callback_dat(base):
     code = read_text_file(CALLBACK_SOURCE_PATH, "matterbending_callbacks.py")
-    hand_logic1 = create_op(base, textDAT, "hand_logic1", "Execute DAT source (Text DAT)")
+    hand_logic1 = create_op(base, "textDAT", "hand_logic1", "Execute DAT source (Text DAT)")
     if hand_logic1 is None:
         return None
-
-    exec_dat = create_op(base, executeDAT, "hand_logic1_exec", "Execute DAT")
     if code:
         hand_logic1.text = code
+
+    exec_dat = create_op(base, "executeDAT", "hand_logic1_exec", "Execute DAT")
+    if exec_dat is None:
+        return None
     set_par(exec_dat, "framestart", 1, "run on Frame Start")
 
     # Point the Execute DAT at the callback source so it actually calls
@@ -264,7 +305,12 @@ def build():
         log("removing existing /matterbending1 and rebuilding from scratch")
         existing.destroy()
 
-    base = root_container.create(baseCOMP, "matterbending1")
+    base_optype = resolve_optype("baseCOMP")
+    if base_optype is None:
+        log("FATAL: baseCOMP isn't available in this TouchDesigner version -- cannot continue.")
+        return
+
+    base = root_container.create(base_optype, "matterbending1")
     REPORT["created"].append("matterbending1")
     log("created container /matterbending1")
 
